@@ -2,7 +2,6 @@ application: natis-incident-api
 version: "1.0.0"
 description: "NATIS Incident Analyzer · IS Shipping Brasil"
 owner: danillo.ferreira@mercadolivre.com
-team: is-natis
 
 runtime:
   language: python
@@ -17,26 +16,8 @@ environment:
   ATLASSIAN_CLOUD_ID: a55c251b-e222-488f-8975-3ccdf0a0db6f
   GRID_HOST: https://grid.melioffice.com
   NATIS_EMAIL: danillo.ferreira@mercadolivre.com
-  OTEL_AGENT_ENABLED: "true"
-
-secrets:
-  - name: ATLASSIAN_TOKEN
-    key: natis/atlassian-token
-  - name: DD_API_KEY
-    key: natis/datadog-api-key
-  - name: DD_APP_KEY
-    key: natis/datadog-app-key
-  - name: DRIVE_TOKEN
-    key: natis/drive-token
-  - name: SLACK_TOKEN
-    key: natis/slack-token
-  - name: ANTHROPIC_API_KEY
-    key: natis/anthropic-api-key
-
-scaling:
-  min_replicas: 1
-  max_replicas: 3
-  target_cpu: 70
+  DRIVE_RECORDINGS_FOLDER: 1N5h4IluBk3CTR2cpmQH0TQl_4_sQ3k1H
+  DRIVE_NATIS_FOLDER: 1kUxGcMk4_p1QGRgoCaVkXiIS_eRSD9UG
 
 health:
   path: /ping
