@@ -1,12 +1,12 @@
 application: natis-incident-api
-version: "1.0.0"
-description: "NATIS Incident Analyzer · IS Shipping Brasil"
+version: "2.0.0"
+description: "NATIS Incident Analyzer · IS Shipping Brasil · FastAPI + GenAI + Whisper"
 owner: danillo.ferreira@mercadolivre.com
 
 runtime:
   language: python
   version: "3.12"
-  command: uvicorn app.main:app --host 0.0.0.0 --port 8080
+  command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
 
 environment:
   GENAI_SCOPE: prod
@@ -18,11 +18,25 @@ environment:
   NATIS_EMAIL: danillo.ferreira@mercadolivre.com
   DRIVE_RECORDINGS_FOLDER: 1N5h4IluBk3CTR2cpmQH0TQl_4_sQ3k1H
   DRIVE_NATIS_FOLDER: 1kUxGcMk4_p1QGRgoCaVkXiIS_eRSD9UG
+  DD_SITE: datadoghq.com
+  OTEL_AGENT_ENABLED: "true"
+
+secrets:
+  - name: ATLASSIAN_TOKEN
+    key: natis/atlassian-token
+  - name: DD_API_KEY
+    key: natis/datadog-api-key
+  - name: DD_APP_KEY
+    key: natis/datadog-app-key
+  - name: SLACK_TOKEN
+    key: natis/slack-token
+  - name: DRIVE_TOKEN
+    key: natis/drive-token
 
 health:
   path: /ping
   interval: 30
 
 resources:
-  cpu: "500m"
-  memory: "512Mi"
+  cpu: "1000m"
+  memory: "1Gi"
