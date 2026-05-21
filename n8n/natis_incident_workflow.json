@@ -1,0 +1,152 @@
+{
+  "name": "NATIS Incident Analyzer",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "analyze-incident",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ticket = $input.first().json.ticket || $input.first().json.body?.ticket;\nconst num = ticket.replace(/\\D/g,'');\nreturn [{\n  json: {\n    ticket: ticket.toUpperCase(),\n    num,\n    sshp: `SSHP-${num}`,\n    jira_url: `https://mercadolibre.atlassian.net/rest/api/3/issue/SSHP-${num}`,\n    confluence_url: `https://mercadolibre.atlassian.net/wiki/rest/api/content/search?cql=space=%22ISSM%22%20AND%20text~%22${num}%22`,\n    datadog_url: `https://api.datadoghq.com/api/v2/incidents?filter[query]=${num}`,\n    slack_query: `SSHP-${num}`\n  }\n}];"
+      },
+      "id": "extract-ticket",
+      "name": "Extrair Ticket",
+      "type": "n8n-nodes-base.code",
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "1", "name": "jira_url", "value": "={{ $json.jira_url }}", "type": "string"},
+            {"id": "2", "name": "ticket", "value": "={{ $json.ticket }}", "type": "string"}
+          ]
+        }
+      },
+      "id": "set-vars",
+      "name": "Set Variables",
+      "type": "n8n-nodes-base.set",
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Extrair Ticket').item.json.jira_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {"timeout": 15000}
+      },
+      "id": "fetch-jira",
+      "name": "Buscar Jira",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [840, 200],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Extrair Ticket').item.json.confluence_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {"timeout": 15000}
+      },
+      "id": "fetch-confluence",
+      "name": "Buscar Confluence",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [840, 320],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Extrair Ticket').item.json.datadog_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {"timeout": 15000}
+      },
+      "id": "fetch-datadog",
+      "name": "Buscar Datadog",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [840, 440],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://natis-incident-api.melioffice.com/api/v1/analyze",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Content-Type", "value": "application/json"},
+            {"name": "X-User-Email", "value": "danillo.ferreira@mercadolivre.com"}
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {"name": "ticket", "value": "={{ $('Extrair Ticket').item.json.ticket }}"},
+            {"name": "save_to_drive", "value": true},
+            {"name": "save_to_grid", "value": true},
+            {"name": "language", "value": "pt-BR"}
+          ]
+        }
+      },
+      "id": "call-natis-api",
+      "name": "NATIS API",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1040, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst ticket = data.ticket;\nconst report = data.report || '';\n\n// Extrai resumo executivo\nconst execMatch = report.match(/## 📊 RESUMO EXECUTIVO[\\s\\S]*?(?=## |$)/);\nconst execSummary = execMatch ? execMatch[0].replace(/## 📊 RESUMO EXECUTIVO/,'').trim().slice(0,800) : 'Análise completa disponível no grid.';\n\n// Extrai action items\nconst actionMatch = report.match(/## ✅ ACTION ITEMS[\\s\\S]*?(?=## |$)/);\nconst actionItems = actionMatch ? actionMatch[0].replace(/## ✅ ACTION ITEMS PRIORIZADOS/,'').trim().slice(0,400) : '';\n\nreturn [{\n  json: {\n    ticket,\n    exec_summary: execSummary,\n    action_items: actionItems,\n    grid_url: data.grid_url || '',\n    drive_url: data.drive_url || '',\n    duration: data.duration_seconds,\n    sources: data.sources_consulted?.filter(s => s.startsWith('✅')).length || 0\n  }\n}];"
+      },
+      "id": "extract-summary",
+      "name": "Extrair Resumo",
+      "type": "n8n-nodes-base.code",
+      "position": [1240, 300]
+    },
+    {
+      "parameters": {
+        "channel": "#war-room-nats-sre",
+        "text": ":rotating_light: *NATIS Incident Analysis — {{ $json.ticket }}*\n\n:bar_chart: *Resumo Executivo:*\n{{ $json.exec_summary }}\n\n:white_check_mark: *Action Items Urgentes:*\n{{ $json.action_items }}\n\n:link: *Relatório completo:* {{ $json.grid_url }}\n:floppy_disk: *Drive:* {{ $json.drive_url }}\n\n_Analisado em {{ $json.duration }}s · {{ $json.sources }} fontes consultadas_",
+        "otherOptions": {}
+      },
+      "id": "notify-slack",
+      "name": "Notificar Slack",
+      "type": "n8n-nodes-base.slack",
+      "position": [1440, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({status: 'success', ticket: $('Extrair Resumo').item.json.ticket, grid_url: $('Extrair Resumo').item.json.grid_url, drive_url: $('Extrair Resumo').item.json.drive_url, message: 'Análise concluída e enviada ao Slack'}) }}"
+      },
+      "id": "respond",
+      "name": "Responder",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1640, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {"main": [[{"node": "Extrair Ticket", "type": "main", "index": 0}]]},
+    "Extrair Ticket": {"main": [[{"node": "Set Variables", "type": "main", "index": 0}]]},
+    "Set Variables": {"main": [[
+      {"node": "Buscar Jira", "type": "main", "index": 0},
+      {"node": "Buscar Confluence", "type": "main", "index": 0},
+      {"node": "Buscar Datadog", "type": "main", "index": 0}
+    ]]},
+    "Buscar Datadog": {"main": [[{"node": "NATIS API", "type": "main", "index": 0}]]},
+    "NATIS API": {"main": [[{"node": "Extrair Resumo", "type": "main", "index": 0}]]},
+    "Extrair Resumo": {"main": [[{"node": "Notificar Slack", "type": "main", "index": 0}]]},
+    "Notificar Slack": {"main": [[{"node": "Responder", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1"}
+}
