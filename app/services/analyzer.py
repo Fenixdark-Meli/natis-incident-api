@@ -11,8 +11,10 @@ from app.services.sources.drive_client import DriveClient
 from app.services.sources.slack_client import SlackClient
 from app.services.report_generator import ReportGenerator
 from app.services.grid_client import GridClient
+from app.services.transcription_service import TranscriptionService
 
 logger = logging.getLogger(__name__)
+
 
 class IncidentAnalyzer:
     def __init__(self):
@@ -23,30 +25,35 @@ class IncidentAnalyzer:
         self.slack = SlackClient()
         self.report_gen = ReportGenerator()
         self.grid = GridClient()
+        self.transcription = TranscriptionService()
 
     async def analyze(self, req: AnalyzeRequest) -> AnalyzeResponse:
         start = time.time()
         ticket = req.ticket.strip().upper()
-        logger.info(f"[NATIS] Iniciando análise: {ticket}")
+        logger.info(f"[NATIS] Analisando: {ticket}")
 
-        # ── Coleta dados de todas as fontes em paralelo ──
+        # 1. Busca dados em paralelo
         sources, sources_consulted = await self._gather_sources(ticket)
 
-        # ── Gera relatório via GenAI ──
-        report_md = await self.report_gen.generate(ticket, sources, req.language)
+        # 2. Tenta transcrever gravação se encontrada
+        transcription = await self._get_transcription(sources)
+
+        # 3. Gera relatório
+        report_md = await self.report_gen.generate(
+            ticket, sources, req.language, transcription
+        )
         report_html = self._md_to_html(report_md, ticket)
 
-        # ── Salva no Drive e Grid ──
+        # 4. Salva
         grid_url, drive_url = None, None
-        save_tasks = []
-
+        tasks = []
         if req.save_to_drive:
-            save_tasks.append(self.drive.save_report(ticket, report_md))
+            tasks.append(self.drive.save_report(ticket, report_md))
         if req.save_to_grid:
-            save_tasks.append(self.grid.upload(ticket, report_html, req.user_email))
+            tasks.append(self.grid.upload(ticket, report_html, req.user_email))
 
-        if save_tasks:
-            results = await asyncio.gather(*save_tasks, return_exceptions=True)
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             idx = 0
             if req.save_to_drive:
                 drive_url = results[idx] if not isinstance(results[idx], Exception) else None
@@ -55,101 +62,114 @@ class IncidentAnalyzer:
                 grid_url = results[idx] if not isinstance(results[idx], Exception) else None
 
         duration = round(time.time() - start, 2)
-        logger.info(f"[NATIS] Análise concluída: {ticket} em {duration}s")
+        logger.info(f"[NATIS] Concluído: {ticket} em {duration}s")
 
         return AnalyzeResponse(
-            ticket=ticket,
-            status="success",
-            report=report_md,
-            report_html=report_html,
+            ticket=ticket, status="success",
+            report=report_md, report_html=report_html,
             sources_consulted=sources_consulted,
-            grid_url=grid_url,
-            drive_url=drive_url,
+            grid_url=grid_url, drive_url=drive_url,
             generated_at=__import__('datetime').datetime.utcnow().isoformat() + "Z",
             duration_seconds=duration,
-            metadata={"sources_found": len([s for s in sources_consulted if "❌" not in s])}
+            metadata={
+                "sources_found": len([s for s in sources_consulted if "✅" in s]),
+                "has_transcription": transcription is not None,
+                "report_length": len(report_md)
+            }
         )
 
+    async def _get_transcription(self, sources: SourceData) -> Optional[str]:
+        """Tenta transcrever gravação do war room"""
+        if not sources.drive:
+            return None
+        recordings = sources.drive.get("recordings", [])
+        for f in recordings:
+            name = f.get("name", "").lower()
+            if any(ext in name for ext in [".mp4", ".mp3", ".webm", ".m4a"]):
+                logger.info(f"Transcrevendo: {f.get('name')}")
+                result = await self.transcription.transcribe_from_drive(f.get("id", ""))
+                if result:
+                    return result
+        return None
+
     async def _gather_sources(self, ticket: str):
-        sshp_num = ''.join(filter(str.isdigit, ticket))
-        sshp_key = f"SSHP-{sshp_num}" if sshp_num else ticket
-        issm_key = f"ISSM-{sshp_num}" if sshp_num else ticket
+        num = ''.join(filter(str.isdigit, ticket))
+        sshp = f"SSHP-{num}" if num else ticket
 
         tasks = [
-            self.jira.get_issue(sshp_key),
-            self.jira.search_related(sshp_num),
-            self.confluence.search(sshp_num),
-            self.confluence.search(issm_key),
-            self.datadog.search_incidents(sshp_num),
-            self.drive.search(sshp_num),
-            self.drive.search(sshp_num, settings.DRIVE_NATIS_FOLDER),
-            self.slack.search(sshp_key),
+            self.jira.get_issue(sshp),
+            self.jira.search_related(num),
+            self.confluence.search(num),
+            self.confluence.search(sshp),
+            self.datadog.search_incidents(num),
+            self.drive.search(num),
+            self.drive.search(num, settings.DRIVE_NATIS_FOLDER),
+            self.slack.search(sshp),
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         def safe(r, name):
             if isinstance(r, Exception):
-                logger.warning(f"{name} error: {r}")
-                return None, f"❌ {name}: {str(r)[:60]}"
+                return None, f"❌ {name}: {str(r)[:50]}"
             return r, f"✅ {name}"
 
-        jira_issue, s0 = safe(results[0], "Jira · ticket principal")
-        jira_related, s1 = safe(results[1], "Jira · tickets correlatos")
-        confluence_issm, s2 = safe(results[2], "Confluence ISSM")
-        confluence_issm2, s3 = safe(results[3], "Confluence ISSM correlato")
-        dd_incidents, s4 = safe(results[4], "Datadog · bitácora")
-        drive_recs, s5 = safe(results[5], "Drive · gravações")
-        drive_natis, s6 = safe(results[6], "Drive · NATIS")
-        slack_msgs, s7 = safe(results[7], "Slack · canal incidente")
+        ji, s0 = safe(results[0], "Jira · ticket")
+        jr, s1 = safe(results[1], "Jira · correlatos")
+        cf1, s2 = safe(results[2], "Confluence ISSM")
+        cf2, s3 = safe(results[3], "Confluence correlato")
+        dd, s4 = safe(results[4], "Datadog")
+        dr1, s5 = safe(results[5], "Drive gravações")
+        dr2, s6 = safe(results[6], "Drive NATIS")
+        sl, s7 = safe(results[7], "Slack")
 
         sources = SourceData(
-            jira={
-                "issue": jira_issue,
-                "related": jira_related or []
-            },
-            confluence={
-                "pages": (confluence_issm or []) + (confluence_issm2 or [])
-            },
-            datadog={"incidents": dd_incidents or []},
-            drive={
-                "recordings": drive_recs or [],
-                "natis": drive_natis or []
-            },
-            slack={"messages": slack_msgs or []}
+            jira={"issue": ji, "related": jr or []},
+            confluence={"pages": (cf1 or []) + (cf2 or [])},
+            datadog={"incidents": dd or []},
+            drive={"recordings": dr1 or [], "natis": dr2 or []},
+            slack={"messages": sl or []}
         )
-
         return sources, [s0, s1, s2, s3, s4, s5, s6, s7]
 
     def _md_to_html(self, md: str, ticket: str) -> str:
-        import re
-        h = md.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+        import re, datetime
+        h = md.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         h = re.sub(r'^## (.+)$', r'<h2>\1</h2>', h, flags=re.M)
         h = re.sub(r'^### (.+)$', r'<h3>\1</h3>', h, flags=re.M)
         h = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', h)
         h = re.sub(r'^[\-\*] (.+)$', r'<li>\1</li>', h, flags=re.M)
-        h = re.sub(r'^(\d+)\. (.+)$', r'<li>\2</li>', h, flags=re.M)
-        h = re.sub(r'^---$', r'<hr/>', h, flags=re.M)
-        h = re.sub(r'^> (.+)$', r'<blockquote>\1</blockquote>', h, flags=re.M)
-        h = h.replace('\n\n', '</p><p>').replace('\n', '<br/>')
-        return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"/>
+        h = re.sub(r'^\|(.+)\|$', lambda m: '<tr>' + ''.join(f'<td>{c.strip()}</td>' for c in m.group(1).split('|')) + '</tr>', h, flags=re.M)
+        h = re.sub(r'^---$', '<hr/>', h, flags=re.M)
+        return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"/>
 <title>NATIS · {ticket}</title>
 <style>
-body{{font-family:system-ui,sans-serif;max-width:960px;margin:40px auto;padding:20px;color:#1a1a2e;line-height:1.7;background:#fff;}}
-.header{{background:#FFE600;padding:14px 20px;border-radius:8px;margin-bottom:24px;}}
-h2{{color:#1a1a2e;border-bottom:3px solid #FFE600;padding-bottom:6px;margin:24px 0 10px;}}
-h3{{color:#333;margin:16px 0 6px;}}
-blockquote{{border-left:4px solid #FFE600;padding:8px 14px;background:#fffce0;margin:10px 0;border-radius:0 6px 6px 0;}}
-code{{background:#f0f0f0;padding:2px 6px;border-radius:3px;font-size:12px;}}
-li{{margin:4px 0;}} table{{width:100%;border-collapse:collapse;}}
-th{{background:#1a1a2e;color:#fff;padding:8px 12px;text-align:left;}}
-td{{padding:7px 12px;border-bottom:1px solid #eee;}}
-.footer{{margin-top:40px;padding-top:16px;border-top:2px solid #FFE600;font-size:12px;color:#666;}}
+:root{{--yellow:#FFE600;--dark:#1a1a2e;--gray:#f5f5f5;}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:1000px;margin:0 auto;padding:24px;color:var(--dark);line-height:1.7;background:#fff;}}
+.hdr{{background:var(--yellow);padding:16px 24px;border-radius:10px;margin-bottom:28px;display:flex;justify-content:space-between;align-items:center;}}
+.hdr h1{{font-size:18px;margin:0;}}
+.hdr small{{font-size:12px;color:#555;}}
+h2{{border-bottom:3px solid var(--yellow);padding-bottom:6px;margin:28px 0 12px;font-size:16px;}}
+h3{{color:#333;margin:16px 0 6px;font-size:14px;}}
+li{{margin:4px 0;}}
+table{{width:100%;border-collapse:collapse;margin:10px 0;}}
+th{{background:var(--dark);color:#fff;padding:8px 12px;text-align:left;font-size:12px;}}
+td{{padding:7px 12px;border-bottom:1px solid #eee;font-size:13px;}}
+tr:hover td{{background:var(--gray);}}
+blockquote{{border-left:4px solid var(--yellow);padding:8px 14px;background:#fffce0;margin:10px 0;border-radius:0 6px 6px 0;font-style:italic;}}
+.footer{{margin-top:40px;padding:16px 24px;border-top:3px solid var(--yellow);font-size:11px;color:#666;display:flex;justify-content:space-between;}}
+@media(max-width:600px){{body{{padding:12px;}}}}
 </style></head><body>
-<div class="header">
-  <strong style="font-size:18px;">⚙ NATIS · Relatório de Incidente · {ticket}</strong>
-  <div style="font-size:12px;margin-top:4px;">IS Shipping Brasil · Mercado Livre · Gerado automaticamente</div>
+<div class="hdr">
+  <div>
+    <h1>⚙ NATIS · Relatório de Incidente · {ticket}</h1>
+    <small>IS Shipping Brasil · Mercado Livre · {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}</small>
+  </div>
 </div>
 <div>{h}</div>
-<div class="footer">Gerado por NATIS Incident Analyzer · grid.adminml.com · IS Shipping Brasil</div>
+<div class="footer">
+  <span>Gerado por NATIS Incident Analyzer · IS Shipping Brasil</span>
+  <span>{datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}</span>
+</div>
 </body></html>"""
